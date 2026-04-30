@@ -1,0 +1,156 @@
+import streamlit as st
+import pandas as pd
+import paho.mqtt.client as mqtt
+import time
+import random
+from datetime import datetime
+
+# ==========================================
+# 1. CACHED MEMORY BRIDGE
+# ==========================================
+@st.cache_resource
+def start_mqtt():
+    client_id = f"staney_dash_{random.randint(1000, 9999)}"
+    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=client_id)
+    
+    # Initialize the memory variables
+    client.latest_payload = 0.0 
+    client.failed_pubs = 0
+    client.total_pubs = 0
+    client.rssi = 0
+
+    def on_connect(client, userdata, flags, reason_code, properties):
+        if reason_code == 0:
+            # Safest way to subscribe: two separate calls
+            client.subscribe("staney/scale/weight")
+            client.subscribe("staney/scale/network")
+            print("✅ Dashboard Subscribed to Data and Network Topics")
+
+    def on_message(client, userdata, message):
+        topic = message.topic
+        raw_str = message.payload.decode("utf-8")
+        
+        if topic == "staney/scale/weight":
+            try:
+                client.latest_payload = float(raw_str)
+            except:
+                pass
+        elif topic == "staney/scale/network":
+            # Parse the incoming string: "FAILED|TOTAL|RSSI"
+            try:
+                parts = raw_str.split("|")
+                client.failed_pubs = int(parts[0])
+                client.total_pubs = int(parts[1])
+                client.rssi = int(parts[2])
+            except:
+                pass
+
+    client.on_connect = on_connect
+    client.on_message = on_message
+    
+    client.tls_set() 
+    client.username_pw_set("Thesis", "Chiang111") 
+    client.connect("3dd5708713a94191ab75d9b92812e7bf.s1.eu.hivemq.cloud", 8883)
+    client.loop_start()
+    return client
+
+mqtt_client = start_mqtt()
+
+# ==========================================
+# 2. INITIALIZE SYSTEM STATE
+# ==========================================
+st.set_page_config(page_title="Staney's Smart IoT Scale", layout="wide")
+
+if 'history' not in st.session_state:
+    st.session_state.history = pd.DataFrame(columns=['Time', 'Weight'])
+if 'last_val' not in st.session_state:
+    st.session_state.last_val = 0.0
+if 'current_page' not in st.session_state:
+    st.session_state.current_page = 'welcome'
+if 'calibration_factor' not in st.session_state:
+    st.session_state.calibration_factor = 1.0 
+
+# ==========================================
+# 3. DATA PROCESSING
+# ==========================================
+raw_val = getattr(mqtt_client, 'latest_payload', 0.0)
+calibrated_weight = raw_val * st.session_state.calibration_factor
+
+if st.session_state.current_page == 'dashboard':
+    st.session_state.last_val = calibrated_weight
+    new_row = pd.DataFrame({'Time': [datetime.now()], 'Weight': [calibrated_weight]})
+    st.session_state.history = pd.concat([st.session_state.history, new_row], ignore_index=True).tail(100)
+
+# ==========================================
+# 4. UI: WELCOME SCREEN
+# ==========================================
+if st.session_state.current_page == 'welcome':
+    st.markdown('<div style="text-align:center; margin-top:20vh; font-size:4rem; font-weight:bold;">Welcome to Staney\'s IoT System</div>', unsafe_allow_html=True)
+    st.write("")
+    _, col2, _ = st.columns([2, 1, 2])
+    with col2:
+        if st.button("🚀 ENTER DASHBOARD", width="stretch"):
+            st.session_state.current_page = 'dashboard'
+            st.rerun()
+
+# ==========================================
+# 5. UI: MAIN DASHBOARD
+# ==========================================
+else:
+    with st.sidebar:
+        st.title("🎛️ Navigation")
+        menu = st.radio("Select View:", ["📊 Live Status", "📈 Data Analytics", "⚙️ AI Calibration"])
+        st.divider()
+        if st.button("⬅️ Exit System"):
+            st.session_state.current_page = 'welcome'
+            st.rerun()
+
+    if menu == "📊 Live Status":
+        st.header("📡 Real-Time Telemetry")
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Current Payload", f"{st.session_state.last_val:.3f} kg")
+        c2.metric("Connection", "Stable" if mqtt_client.is_connected() else "Offline")
+        c3.metric("Sample Count", len(st.session_state.history))
+        
+        # --- Network Health UI ---
+        st.divider()
+        st.markdown("#### 📶 Network Health")
+        
+        failed = getattr(mqtt_client, 'failed_pubs', 0)
+        total = getattr(mqtt_client, 'total_pubs', 0)
+        rssi = getattr(mqtt_client, 'rssi', 0)
+        packet_loss = (failed / total * 100) if total > 0 else 0.0
+        
+        n1, n2, n3 = st.columns(3)
+        n1.metric("Wi-Fi Signal (RSSI)", f"{rssi} dBm")
+        n2.metric("Packet Loss", f"{packet_loss:.1f}%")
+        n3.metric("Total Transmissions", f"{total}")
+        
+        st.divider()
+        st.subheader("Live Feed")
+        if not st.session_state.history.empty:
+            st.line_chart(st.session_state.history.set_index('Time'))
+        
+        time.sleep(1)
+        st.rerun()
+
+    elif menu == "📈 Data Analytics":
+        st.header("📈 Historical Data Analysis")
+        if not st.session_state.history.empty:
+            st.dataframe(st.session_state.history.sort_values(by='Time', ascending=False), width="stretch")
+            csv = st.session_state.history.to_csv(index=False).encode('utf-8')
+            st.download_button("📥 Download Dataset", csv, "scale_data.csv", "text/csv")
+
+    elif menu == "⚙️ AI Calibration":
+        st.header("⚙️ Intelligent Calibration")
+        new_cf = st.number_input("Calibration Factor", value=st.session_state.calibration_factor, step=0.001, format="%.4f")
+        if st.button("Apply New Calibration"):
+            st.session_state.calibration_factor = new_cf
+            st.success("Calibration updated.")
+
+        with st.expander("🛠️ Advanced Maintenance"):
+            if st.button("Remote Tare (Zero Scale)"):
+                mqtt_client.publish("staney/scale/command", "zero")
+                st.warning("Tare command sent.")
+
+st.markdown("<style>.stApp { background-color: #F0F2F6; }</style>", unsafe_allow_html=True)
