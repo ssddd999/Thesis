@@ -47,7 +47,7 @@ def start_mqtt():
         
         if topic == "staney/scale/weight":
             try:
-                # --- NEW: NTP Auto-Latency Parsing ---
+                # --- NTP Auto-Latency Parsing ---
                 parts = raw_str.split("|")
                 
                 # Part 1: The actual weight
@@ -175,14 +175,43 @@ def show_data_analytics():
     
     st.header("📈 System Analytics & Logs")
     
-    # --- NEW: Automated Latency Dashboard (No buttons needed!) ---
-    st.subheader("📡 Real-Time Telemetry Performance")
-    colA, colB = st.columns(2)
+    st.subheader("📡 Real-Time Telemetry & Forecasting")
+    
+    # --- CHANGED: Created 3 columns to fit the AI Predictor ---
+    colA, colB, colC = st.columns(3)
     
     with colA:
         st.metric("Package Latency (NTP Auto-Tracked)", f"{mqtt_c.network_latency} ms" if mqtt_c.network_latency > 0 else "-- ms")
+    
     with colB:
         st.metric("Total Data Points Collected", f"{mqtt_c.sample_count}")
+
+    # ==========================================
+    # 🤖 AI PREDICTIVE FORECASTING ALGORITHM
+    # ==========================================
+    with colC:
+        if len(st.session_state.history) >= 15:
+            recent_data = st.session_state.history.tail(15)
+            start_weight = recent_data['Weight (g)'].iloc[0]
+            current_weight = recent_data['Weight (g)'].iloc[-1]
+            weight_lost = start_weight - current_weight
+            
+            if weight_lost > 2.0:
+                rate_per_sec = weight_lost / 15.0 
+                if rate_per_sec > 0:
+                    seconds_remaining = current_weight / rate_per_sec
+                    mins, secs = divmod(int(max(0, seconds_remaining)), 60)
+                    
+                    st.metric("🤖 Time to Empty", f"{mins}m {secs}s", f"-{rate_per_sec:.1f} g/sec", delta_color="inverse")
+                    
+                    if mins < 1:
+                        st.warning("⚠️ Critical: Material Exhaustion Imminent!")
+            elif weight_lost < -2.0:
+                st.metric("🤖 Time to Empty", "Refilling...", "+ Filling")
+            else:
+                st.metric("🤖 Time to Empty", "Stable", "0.0 g/sec")
+        else:
+            st.metric("🤖 Time to Empty", "Gathering data...")
 
     st.divider()
 
