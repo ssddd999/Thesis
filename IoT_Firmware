@@ -4,9 +4,25 @@
 #include <WiFiClientSecure.h> 
 #include <PubSubClient.h>
 #include <WiFiManager.h> 
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h> 
+#include <Preferences.h>
+#include <time.h> // <-- Required for NTP Time Tracking
 
 // ==========================================
-// 1. CLOUD SETTINGS
+// 1. HARDWARE & LCD SETTINGS
+// ==========================================
+const int LOADCELL_DOUT_PIN = 16;
+const int LOADCELL_SCK_PIN = 17;
+const int TARE_BUTTON_PIN = 19; 
+
+const float CALIBRATION_FACTOR = 100; 
+LiquidCrystal_I2C lcd(0x27, 16, 2); 
+HX711 scale;
+Preferences preferences; 
+
+// ==========================================
+// 2. CLOUD SETTINGS
 // ==========================================
 const char* MQTT_BROKER = "3dd5708713a94191ab75d9b92812e7bf.s1.eu.hivemq.cloud"; 
 const int MQTT_PORT = 8883; 
@@ -16,20 +32,34 @@ const char* MQTT_PASS = "Staneychiang12";
 const char* TOPIC_WEIGHT = "staney/scale/weight";
 const char* TOPIC_NETWORK = "staney/scale/network";
 const char* TOPIC_COMMAND = "staney/scale/command";
+const char* TOPIC_WIFI = "staney/scale/wifi"; 
 
 // ==========================================
-// 2. HARDWARE & LOGIC SETTINGS
+// 3. MECHATRONIC LOGIC & STATE VARIABLES
 // ==========================================
-const int LOADCELL_DOUT_PIN = 21;
-const int LOADCELL_SCK_PIN = 22;
-const float CALIBRATION_FACTOR = 461.96; 
-
-HX711 scale;
 float smoothed_weight = 0.0;
 unsigned long lastMsgTime = 0;
 unsigned long lastNetTime = 0;
 
-// Stats for Packet Loss
+unsigned long creepTimer = 0; 
+bool isCreeping = false;
+
+unsigned long stableTimer = 0;
+float previous_weight = 0.0;
+bool isStable = false;
+float locked_weight = 0.0;
+
+// --- BUTTON STATE & POWER SAVING VARIABLES ---
+int buttonState = HIGH;             
+int lastButtonState = HIGH;   
+unsigned long lastDebounceTime = 0;  
+unsigned long debounceDelay = 150; // Increased slightly for mechanical switch
+
+unsigned long buttonPressTime = 0; 
+bool isButtonPressed = false;
+bool actionTriggered = false;      // Prevents multiple triggers while holding
+bool isPowerSavingMode = false;    // Tracks if the system is asleep
+
 unsigned long totalSent = 0;
 unsigned long failedSent = 0;
 
@@ -37,25 +67,82 @@ WiFiClientSecure espClient;
 PubSubClient mqttClient(espClient);
 
 // ==========================================
-// 3. MQTT CALLBACK (Remote Tare)
+// 4. MQTT CALLBACK (Remote Commands)
 // ==========================================
 void callback(char* topic, byte* payload, unsigned int length) {
-  if (String(topic) == TOPIC_COMMAND) {
-    scale.tare();
-    smoothed_weight = 0.0;
-    Serial.println("Scale Tared Remotely!");
+  String message;
+  for (int i = 0; i < length; i++) {
+    message += (char)payload[i];
+  }
+
+  // Only execute cloud commands if the scale is AWAKE
+  if (!isPowerSavingMode) {
+      // --- COMMAND 1: REMOTE TARE ---
+      if (String(topic) == TOPIC_COMMAND) {
+        scale.tare();
+        smoothed_weight = 0.0;
+        isStable = false; 
+        isCreeping = false;
+        Serial.println("Scale Tared Remotely via Cloud!");
+        
+        lcd.clear();
+        lcd.setCursor(0, 0);
+        lcd.print(" REMOTE TARE! ");
+      }
+      
+      // --- COMMAND 2: REMOTE WI-FI UPDATE ---
+      else if (String(topic) == TOPIC_WIFI) {
+        Serial.println("New Wi-Fi Credentials Received!");
+        
+        int separatorIndex = message.indexOf('|');
+        if (separatorIndex > 0) {
+          String newSSID = message.substring(0, separatorIndex);
+          String newPASS = message.substring(separatorIndex + 1);
+          
+          preferences.begin("wifi_creds", false);
+          preferences.putString("ssid", newSSID);
+          preferences.putString("pass", newPASS);
+          preferences.end();
+          
+          WiFiManager wm;
+          wm.resetSettings();
+    
+          lcd.clear();
+          lcd.setCursor(0, 0);
+          lcd.print("Wi-Fi Updated!");
+          lcd.setCursor(0, 1);
+          lcd.print("Rebooting...");
+          delay(2000);
+          
+          ESP.restart(); 
+        }
+      }
+    
+      // --- COMMAND 3: PING-PONG LATENCY ---
+      else if (String(topic) == "staney/scale/ping") {
+        Serial.println("Ping received! Bouncing to Streamlit...");
+        mqttClient.publish("staney/scale/pong", message.c_str()); 
+      }
   }
 }
 
 // ==========================================
-// 4. CONNECTION HELPERS
+// 5. CONNECTION HELPERS
 // ==========================================
 void reconnect() {
-  while (!mqttClient.connected() && WiFi.status() == WL_CONNECTED) {
+  // Added constraint: Only try to reconnect if we aren't in power saving mode
+  while (!mqttClient.connected() && WiFi.status() == WL_CONNECTED && !isPowerSavingMode) {
     Serial.print("Connecting to HiveMQ...");
+    lcd.setCursor(0, 1);
+    lcd.print("Conn. Broker...");
+    
     if (mqttClient.connect("ESP32_Scale_Client", MQTT_USER, MQTT_PASS)) {
       Serial.println("Connected!");
       mqttClient.subscribe(TOPIC_COMMAND);
+      mqttClient.subscribe(TOPIC_WIFI); 
+      mqttClient.subscribe("staney/scale/ping"); 
+      lcd.setCursor(0, 1);
+      lcd.print("Broker Linked! ");
     } else {
       delay(5000);
     }
@@ -63,22 +150,57 @@ void reconnect() {
 }
 
 // ==========================================
-// 5. MAIN EXECUTION
+// 6. MAIN EXECUTION
 // ==========================================
 void setup() {
   Serial.begin(115200);
   
+  pinMode(TARE_BUTTON_PIN, INPUT_PULLUP);
+
+  lcd.init();
+  lcd.backlight();
+  lcd.setCursor(0, 0);
+  lcd.print("IoT Scale Booting");
+
   scale.begin(LOADCELL_DOUT_PIN, LOADCELL_SCK_PIN);
   scale.set_scale(CALIBRATION_FACTOR);
   scale.tare(); 
 
-  // --- SECURE CAPTIVE PORTAL ---
-  WiFiManager wm;
-  // This pops up the UI window with password "staney123"
-  if(!wm.autoConnect("Staney_Scale_Setup", "staney123")) {
-      Serial.println("Setup Failed. Resetting...");
-      ESP.restart();
+  // --- CUSTOM UI WI-FI OVERRIDE ---
+  preferences.begin("wifi_creds", true); 
+  String savedSSID = preferences.getString("ssid", "");
+  String savedPASS = preferences.getString("pass", "");
+  preferences.end();
+
+  if (savedSSID != "") {
+    lcd.setCursor(0, 1);
+    lcd.print("UI Wi-Fi Conn...");
+    WiFi.begin(savedSSID.c_str(), savedPASS.c_str());
+    
+    int attempts = 0;
+    while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+      delay(500);
+      attempts++;
+    }
   }
+
+  // --- SECURE CAPTIVE PORTAL (Fallback) ---
+  if (WiFi.status() != WL_CONNECTED) {
+    WiFiManager wm;
+    lcd.setCursor(0, 1);
+    lcd.print("Connect Wi-Fi...");
+    
+    if(!wm.autoConnect("Staney_Scale_Setup", "staney123")) {
+        Serial.println("Setup Failed. Resetting...");
+        lcd.clear();
+        lcd.print("WiFi Fail. Reset");
+        delay(2000);
+        ESP.restart();
+    }
+  }
+
+  // --- Sync time with Global NTP Servers ---
+  configTime(0, 0, "pool.ntp.org", "time.nist.gov");
 
   espClient.setInsecure(); 
   mqttClient.setServer(MQTT_BROKER, MQTT_PORT);
@@ -86,34 +208,186 @@ void setup() {
 }
 
 void loop() {
-  if (WiFi.status() == WL_CONNECTED) {
-    if (!mqttClient.connected()) reconnect();
-    mqttClient.loop();
+  
+  // ==========================================
+  // ADVANCED LONG-PRESS BUTTON LOGIC
+  // ==========================================
+  int reading = digitalRead(TARE_BUTTON_PIN);
+  
+  if (reading != lastButtonState) {
+    lastDebounceTime = millis(); 
   }
 
-  // Smoothing Filter (90% old, 10% new)
-  float raw = scale.get_units(3);
-  smoothed_weight = (0.90 * smoothed_weight) + (0.10 * raw);
-  if (smoothed_weight < 2.0 && smoothed_weight > -2.0) smoothed_weight = 0.0;
+  if ((millis() - lastDebounceTime) > debounceDelay) {
+    if (reading != buttonState) {
+      buttonState = reading;
 
-  unsigned long now = millis();
+      if (buttonState == LOW) {
+        // Button was JUST pressed down
+        buttonPressTime = millis();
+        isButtonPressed = true;
+        actionTriggered = false; 
+      } else {
+        // Button was JUST released
+        isButtonPressed = false;
+        unsigned long pressDuration = millis() - buttonPressTime;
 
-  // Send Weight every 1 second
-  if (now - lastMsgTime > 1000) {
-    lastMsgTime = now;
-    if (mqttClient.connected()) {
-      totalSent++;
-      String msg = String(smoothed_weight, 1);
-      if (!mqttClient.publish(TOPIC_WEIGHT, msg.c_str())) failedSent++;
+        // SHORT PRESS: Trigger normal Tare (Only if awake and no hold action occurred)
+        if (pressDuration < 3000 && !isPowerSavingMode && !actionTriggered) {
+          scale.tare();
+          smoothed_weight = 0.0;
+          isStable = false; 
+          isCreeping = false;
+          
+          Serial.println("Scale Tared Physically!");
+          lcd.clear();
+          lcd.setCursor(0, 0);
+          lcd.print(" MANUAL TARE!   ");
+        }
+      }
     }
   }
 
-  // Send Network Stats every 5 seconds (FAILED|TOTAL|RSSI)
-  if (now - lastNetTime > 5000) {
-    lastNetTime = now;
-    if (mqttClient.connected()) {
-      String netMsg = String(failedSent) + "|" + String(totalSent) + "|" + String(WiFi.RSSI());
-      mqttClient.publish(TOPIC_NETWORK, netMsg.c_str());
+  // --- Handle Hold Logic While Button is Currently Pressed ---
+  if (isButtonPressed && !actionTriggered) {
+    unsigned long currentDuration = millis() - buttonPressTime;
+
+    // RULE 1: If Awake and held for 5 seconds -> TURN OFF
+    if (!isPowerSavingMode && currentDuration >= 5000) {
+      isPowerSavingMode = true;
+      actionTriggered = true; // Stop it from triggering repeatedly
+      
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("  POWER SAVING  ");
+      lcd.setCursor(0, 1);
+      lcd.print("   MODE ON...   ");
+      delay(1500);
+      lcd.noBacklight(); // Turn off LCD Light
+      lcd.clear();
+      
+      // Physically shut down Wi-Fi Radio to save power
+      WiFi.disconnect(true);
+      WiFi.mode(WIFI_OFF); 
+      Serial.println("System Sleeping. Radio OFF.");
+    }
+    
+    // RULE 2: If Asleep and held for 3 seconds -> TURN ON
+    else if (isPowerSavingMode && currentDuration >= 3000) {
+      isPowerSavingMode = false;
+      actionTriggered = true;
+
+      lcd.backlight();
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("   WAKING UP    ");
+      
+      // Turn Wi-Fi Radio back on (Auto-reconnects to the saved network)
+      WiFi.mode(WIFI_STA);
+      WiFi.begin(); 
+      Serial.println("System Waking Up. Radio ON.");
     }
   }
+  
+  lastButtonState = reading;
+
+  // ==========================================
+  // SYSTEM TASKS (ONLY RUN IF AWAKE)
+  // ==========================================
+  if (!isPowerSavingMode) {
+      
+      if (WiFi.status() == WL_CONNECTED) {
+        if (!mqttClient.connected()) reconnect();
+        mqttClient.loop();
+      }
+    
+      // --- SENSOR READING & FILTERING LOGIC ---
+      if (scale.is_ready()) {
+        float raw = scale.get_units(1);
+        
+        if (abs(raw - smoothed_weight) > 10.0) {
+          smoothed_weight = raw; 
+        } else {
+          smoothed_weight = (0.95 * smoothed_weight) + (0.05 * raw); 
+        }
+        
+        if (smoothed_weight < 2.0 && smoothed_weight > -2.0) {
+            smoothed_weight = 0.0;
+            isCreeping = false;
+        }
+        else if ((smoothed_weight >= 2.0 && smoothed_weight <= 7.0) || (smoothed_weight <= -2.0 && smoothed_weight >= -7.0)) {
+          if (!isCreeping) {
+            creepTimer = millis(); 
+            isCreeping = true;
+          } else if (millis() - creepTimer > 3500) { 
+            scale.tare();  
+            smoothed_weight = 0.0;
+            isCreeping = false;
+            isStable = false; 
+          }
+        } else {
+          isCreeping = false; 
+        }
+    
+        float fluctuation = abs(smoothed_weight - previous_weight);
+    
+        if (fluctuation > 1.5) {
+          stableTimer = millis();   
+          isStable = false;         
+          previous_weight = smoothed_weight; 
+        } else {
+          if (!isStable && !isCreeping && (millis() - stableTimer > 2000)) {
+            isStable = true;
+            locked_weight = smoothed_weight; 
+          }
+        }
+      }
+    
+      unsigned long now = millis();
+    
+      // --- SEND DATA AND UPDATE LCD (Every 500ms) ---
+      if (now - lastMsgTime > 500) {
+        lastMsgTime = now;
+        if (mqttClient.connected()) {
+          totalSent++;
+          
+          float display_weight = isStable ? locked_weight : smoothed_weight;
+          
+          // Clean string for the physical LCD screen
+          String lcd_weight_str = String(display_weight, 1);
+          
+          // NTP Epoch Timestamping for the Cloud
+          struct timeval tv;
+          gettimeofday(&tv, NULL);
+          unsigned long long epoch_millis = (unsigned long long)(tv.tv_sec) * 1000 + (unsigned long long)(tv.tv_usec) / 1000;
+          
+          // Package it together as "Weight|Timestamp"
+          char mqtt_payload[50];
+          sprintf(mqtt_payload, "%.1f|%llu", display_weight, epoch_millis);
+          
+          // Send the combined string to Streamlit
+          if (!mqttClient.publish(TOPIC_WEIGHT, mqtt_payload)) failedSent++;
+          
+        // --- UPDATE PHYSICAL LCD UI ---
+          // Row 1: Just the number and unit, centered
+          lcd.setCursor(0, 0);
+          lcd.print("     ");             // 4 blank spaces to center the text
+          lcd.print(lcd_weight_str);     // The actual weight number
+          lcd.print(" g          ");     // The unit, plus extra spaces to wipe old numbers
+          
+          // Row 2: Completely empty
+          lcd.setCursor(0, 1);
+          lcd.print("                "); // 16 blank spaces to guarantee it stays clean
+        }
+      }
+    
+      // Send Network Stats every 5 seconds
+      if (now - lastNetTime > 5000) {
+        lastNetTime = now;
+        if (mqttClient.connected()) {
+          String netMsg = String(failedSent) + "|" + String(totalSent) + "|" + String(WiFi.RSSI());
+          mqttClient.publish(TOPIC_NETWORK, netMsg.c_str());
+        }
+      }
+  } // END OF AWAKE LOGIC
 }
