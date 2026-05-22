@@ -122,41 +122,8 @@ def log_data():
 def show_live_feed():
     esp_is_online, packet_loss = log_data()
     
-    st.header("📊 Live Weight & Forecasting")
+    st.header("📊 Live Weight")
     
-    # ==========================================
-    # 🤖 BACKGROUND AI CALCULATION
-    # ==========================================
-    ai_time = "Gathering data..."
-    ai_rate = ""
-    is_critical = False
-    
-    if len(st.session_state.history) >= 15:
-        recent_data = st.session_state.history.tail(15)
-        start_weight = recent_data['Weight (g)'].iloc[0]
-        current_weight = recent_data['Weight (g)'].iloc[-1]
-        weight_lost = start_weight - current_weight
-        
-        if weight_lost > 2.0:
-            rate_per_sec = weight_lost / 15.0 
-            if rate_per_sec > 0:
-                seconds_remaining = current_weight / rate_per_sec
-                mins, secs = divmod(int(max(0, seconds_remaining)), 60)
-                ai_time = f"{mins}m {secs}s"
-                ai_rate = f"-{rate_per_sec:.1f} g/sec"
-                
-                if mins < 1:
-                    is_critical = True
-        elif weight_lost < -2.0:
-            ai_time = "Refilling..."
-            ai_rate = "+ Filling"
-        else:
-            ai_time = "Stable"
-            ai_rate = "0.0 g/sec"
-
-    # ==========================================
-    # 🖥️ LCD DISPLAY UI
-    # ==========================================
     lcd_style = """
     <style>
     .lcd-text {
@@ -184,10 +151,6 @@ def show_live_feed():
         <p class="lcd-text">{display_weight} <span class="lcd-unit">g</span></p>
     </div>
     """, unsafe_allow_html=True)
-    
-    # --- Critical Warning Banner ---
-    if is_critical:
-        st.error("⚠️ CRITICAL ALARM: Material Exhaustion Imminent! Refill Required.")
 
     if st.button("⚖️ Zero / Tare Scale", use_container_width=True):
         mqtt_c.publish("staney/scale/command", "TARE") 
@@ -195,18 +158,15 @@ def show_live_feed():
 
     st.divider()
     
-    # ==========================================
-    # 📡 LIVE METRICS BAR
-    # ==========================================
-    st.subheader("📡 Real-Time Status")
+    st.subheader("📡 Network Health Status")
     cn1, cn2, cn3, cn4 = st.columns(4)
     
     conn_status = "🟢 Online" if esp_is_online else "🔴 Offline"
     
-    cn1.metric("🤖 Time to Empty", ai_time, ai_rate, delta_color="inverse")
-    cn2.metric("Network Status", conn_status)
-    cn3.metric("RSSI Signal", f"{mqtt_c.rssi} dBm" if esp_is_online else "-- dBm")
-    cn4.metric("Packet Loss", f"{packet_loss:.1f}%" if esp_is_online else "-- %")
+    cn1.metric("Status", conn_status)
+    cn2.metric("RSSI Signal", f"{mqtt_c.rssi} dBm" if esp_is_online else "-- dBm")
+    cn3.metric("Packet Loss", f"{packet_loss:.1f}%" if esp_is_online else "-- %")
+    cn4.metric("Total Transmissions", f"{mqtt_c.total_pubs}" if esp_is_online else "--")
 
 
 @st.fragment(run_every=2)
@@ -215,15 +175,43 @@ def show_data_analytics():
     
     st.header("📈 System Analytics & Logs")
     
-    st.subheader("📡 Real-Time Telemetry Performance")
+    st.subheader("📡 Real-Time Telemetry & Forecasting")
     
-    colA, colB = st.columns(2)
+    # --- CHANGED: Created 3 columns to fit the AI Predictor ---
+    colA, colB, colC = st.columns(3)
     
     with colA:
         st.metric("Package Latency (NTP Auto-Tracked)", f"{mqtt_c.network_latency} ms" if mqtt_c.network_latency > 0 else "-- ms")
     
     with colB:
         st.metric("Total Data Points Collected", f"{mqtt_c.sample_count}")
+
+    # ==========================================
+    # 🤖 AI PREDICTIVE FORECASTING ALGORITHM
+    # ==========================================
+    with colC:
+        if len(st.session_state.history) >= 15:
+            recent_data = st.session_state.history.tail(15)
+            start_weight = recent_data['Weight (g)'].iloc[0]
+            current_weight = recent_data['Weight (g)'].iloc[-1]
+            weight_lost = start_weight - current_weight
+            
+            if weight_lost > 2.0:
+                rate_per_sec = weight_lost / 15.0 
+                if rate_per_sec > 0:
+                    seconds_remaining = current_weight / rate_per_sec
+                    mins, secs = divmod(int(max(0, seconds_remaining)), 60)
+                    
+                    st.metric("🤖 Time to Empty", f"{mins}m {secs}s", f"-{rate_per_sec:.1f} g/sec", delta_color="inverse")
+                    
+                    if mins < 1:
+                        st.warning("⚠️ Critical: Material Exhaustion Imminent!")
+            elif weight_lost < -2.0:
+                st.metric("🤖 Time to Empty", "Refilling...", "+ Filling")
+            else:
+                st.metric("🤖 Time to Empty", "Stable", "0.0 g/sec")
+        else:
+            st.metric("🤖 Time to Empty", "Gathering data...")
 
     st.divider()
 
