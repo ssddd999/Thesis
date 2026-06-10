@@ -205,7 +205,7 @@ def show_data_analytics():
                     st.metric("🤖 Time to Empty", f"{mins}m {secs}s", f"-{rate_per_sec:.1f} g/sec", delta_color="inverse")
                     
                     if mins < 1:
-                        st.warning("⚠️ Critical: Material Exhaustion Imminent!")
+                        st.warning("⚠️ Critical: Low Volume!")
             elif weight_lost < -2.0:
                 st.metric("🤖 Time to Empty", "Refilling...", "+ Filling")
             else:
