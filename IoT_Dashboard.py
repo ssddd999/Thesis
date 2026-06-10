@@ -190,14 +190,14 @@ def show_data_analytics():
     # 🤖 AI PREDICTIVE FORECASTING ALGORITHM
     # ==========================================
     with colC:
-        if len(st.session_state.history) >= 15:
-            recent_data = st.session_state.history.tail(15)
+        if len(st.session_state.history) >= 5:
+            recent_data = st.session_state.history.tail(5)
             start_weight = recent_data['Weight (g)'].iloc[0]
             current_weight = recent_data['Weight (g)'].iloc[-1]
             weight_lost = start_weight - current_weight
             
             if weight_lost > 2.0:
-                rate_per_sec = weight_lost / 15.0 
+                rate_per_sec = weight_lost / 5.0 
                 if rate_per_sec > 0:
                     seconds_remaining = current_weight / rate_per_sec
                     mins, secs = divmod(int(max(0, seconds_remaining)), 60)
